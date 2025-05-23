@@ -11,10 +11,16 @@ import base64
 import logging
 import json
 from datetime import datetime, timedelta
+import torch
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Memory optimization settings
+torch.backends.cudnn.benchmark = True
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 app = FastAPI()
 
@@ -38,6 +44,9 @@ try:
         logger.error(f"Model file not found at {model_path}")
         raise FileNotFoundError(f"Model file not found at {model_path}")
     model = YOLO(model_path)
+    # Set model to evaluation mode and move to CPU
+    model.to('cpu')
+    model.eval()
     logger.info("YOLO model loaded successfully")
 except Exception as e:
     logger.error(f"Error loading YOLO model: {str(e)}")
