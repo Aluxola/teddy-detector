@@ -2,6 +2,8 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import os
+import gc
+import torch
 from ultralytics import YOLO
 import cv2
 import numpy as np
@@ -11,10 +13,12 @@ import base64
 import logging
 import json
 from datetime import datetime, timedelta
-import torch
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Memory optimization settings
@@ -36,21 +40,50 @@ if not os.path.exists(STATS_FILE):
 # Mount static files directory
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Load YOLO model
-try:
-    logger.info("Loading YOLO model...")
-    model_path = "best.pt"  # Model file in root directory
-    if not os.path.exists(model_path):
-        logger.error(f"Model file not found at {model_path}")
-        raise FileNotFoundError(f"Model file not found at {model_path}")
-    model = YOLO(model_path)
-    # Set model to evaluation mode and move to CPU
-    model.to('cpu')
-    model.eval()
-    logger.info("YOLO model loaded successfully")
-except Exception as e:
-    logger.error(f"Error loading YOLO model: {str(e)}")
-    raise
+# Global variable for model
+model = None
+
+def load_model():
+    """Load the YOLO model with memory optimization."""
+    global model
+    try:
+        logger.info("Loading YOLO model...")
+        model_path = "best.pt"
+        if not os.path.exists(model_path):
+            logger.error(f"Model file not found at {model_path}")
+            raise FileNotFoundError(f"Model file not found at {model_path}")
+        
+        # Clear any existing model from memory
+        if model is not None:
+            del model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Load model in inference mode
+        model = YOLO(model_path, task='detect')
+        model.fuse()  # Fuse model layers for inference
+        
+        # Force model to CPU and eval mode
+        model.to('cpu')
+        for m in model.modules():
+            if hasattr(m, 'eval'):
+                m.eval()
+        
+        logger.info("YOLO model loaded successfully")
+    except Exception as e:
+        logger.error(f"Error loading YOLO model: {str(e)}")
+        raise
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the model when the app starts."""
+    load_model()
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "healthy", "model_loaded": model is not None}
 
 @app.get("/stats")
 async def get_stats():
@@ -743,6 +776,14 @@ async def detect(file: UploadFile = File(...)):
     try:
         logger.info(f"Processing uploaded file: {file.filename}")
         
+        # Check if model is loaded
+        if model is None:
+            logger.error("Model not loaded")
+            return JSONResponse(
+                content={"error": "Model not initialized properly"},
+                status_code=503
+            )
+        
         # Read the image file
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
@@ -750,12 +791,27 @@ async def detect(file: UploadFile = File(...)):
         
         if image is None:
             logger.error("Failed to decode image")
-            return JSONResponse(content={"error": "Failed to decode image"}, status_code=400)
+            return JSONResponse(
+                content={"error": "Failed to decode image"},
+                status_code=400
+            )
         
-        logger.info("Running YOLOv8 inference...")
-        # Run YOLOv8 inference
-        results = model(image)
-        logger.info("Inference complete")
+        try:
+            logger.info("Running YOLOv8 inference...")
+            # Run YOLOv8 inference
+            results = model(image)
+            logger.info("Inference complete")
+            
+            # Clear some memory
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            gc.collect()
+            
+        except Exception as e:
+            logger.error(f"Error during inference: {str(e)}")
+            return JSONResponse(
+                content={"error": f"Error during inference: {str(e)}"},
+                status_code=500
+            )
         
         # Update statistics
         with open(STATS_FILE, "r") as f:
@@ -802,10 +858,18 @@ async def detect(file: UploadFile = File(...)):
         is_success, buffer = cv2.imencode(".jpg", result_image)
         if not is_success:
             logger.error("Failed to encode result image")
-            return JSONResponse(content={"error": "Failed to encode result image"}, status_code=500)
+            return JSONResponse(
+                content={"error": "Failed to encode result image"},
+                status_code=500
+            )
             
         img_str = base64.b64encode(buffer).decode()
         logger.info("Successfully processed image")
+        
+        # Clear some memory again
+        del results
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
         # Return appropriate response
         if teddy_count == 0:
