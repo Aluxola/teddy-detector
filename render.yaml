@@ -7,6 +7,10 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.9
+      - key: MALLOC_ARENA_MAX
+        value: 2
+      - key: WEB_CONCURRENCY
+        value: 1
     plan: starter # Specify the plan
     scaling:
       minInstances: 1
